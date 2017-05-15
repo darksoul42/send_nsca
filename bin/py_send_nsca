@@ -1,39 +1,33 @@
 #!/usr/bin/python
-
 import logging
 import optparse
+import os
 import sys
+import select
+import socket
+import daemon
+from grp import getgrnam
+from pwd import getpwnam
 
 import send_nsca
 import send_nsca.nsca
 
-def main():
-    parser = optparse.OptionParser(usage="%prog -H <host_address> [args]")
-    parser.add_option("-H", "--host-address", default=None, dest="host_address", help="The IP address or hostname of the machine running NSCA")
-    parser.add_option("-p", "--port", dest="port", type=int, default=5667, help="The port on which the daemon is running (default %default)")
-    parser.add_option("-t", "--timeout", dest="timeout", type=int, default=10, help="TCP timeout (default %default), 0 for none")
-    parser.add_option("-d", "--delim", dest="delimiter", type=str, default="\t", help="Delimiter between input fields (default TAB)")
-    parser.add_option("-c", "--config-file", dest="config_file", type=str, default="/etc/send_nsca.cfg", help="Path to config file (default %default)")
-    parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="Be more verbose in output")
-    parser.add_option("-V", "--version", dest="version", action="store_true", default=False, help="Show version number")
-    opts, args = parser.parse_args()
+def daemon_main_program(opts):
+    # Do the following while still using elevated privileges
+    try:
+        os.unlink(opts.socket_name)
+    except OSError:
+        if os.path.exists(opts.socket_name):
+            raise
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    server.bind(opts.socket_name)
 
-    format_str = "%(message)s"
-    logging.basicConfig(stream=sys.stderr, level=logging.DEBUG if opts.verbose else logging.INFO, fmt=format_str)
+    while True:
+        result = connection_process(opts, [server.recv(4096)])
 
-    if args:
-        parser.error("This program takes no un-flagged command-line options")
-    if opts.version:
-        print "py_send_nsca %s " %send_nsca.version
-        return 0
-    if not opts.host_address:
-        parser.error("-H is required")
-    if len(opts.delimiter) > 1:
-        parser.error("delimiter must be a single character")
-    if opts.timeout < 0:
-        parser.error("timeout must be nonnegative")
+def connection_process(opts, input_data):
     sender = send_nsca.nsca.NscaSender(remote_host=opts.host_address, config_path=opts.config_file, port=opts.port, timeout=opts.timeout)
-    for line in sys.stdin:
+    for line in input_data:
         line = line.rstrip()
         fields = line.split(opts.delimiter)
         if len(fields) == 3:
@@ -52,6 +46,60 @@ def main():
             return 1
     sender.disconnect()
     return 0
+
+def main():
+    parser = optparse.OptionParser(usage="%prog -H <host_address> [args]")
+    parser.add_option("-H", "--host-address", default=None, dest="host_address", help="The IP address or hostname of the machine running NSCA")
+    parser.add_option("-p", "--port", dest="port", type=int, default=5667, help="The port on which the daemon is running (default %default)")
+    parser.add_option("-t", "--timeout", dest="timeout", type=int, default=10, help="TCP timeout (default %default), 0 for none")
+    parser.add_option("-d", "--delim", dest="delimiter", type=str, default="\t", help="Delimiter between input fields (default TAB)")
+    parser.add_option("-c", "--config-file", dest="config_file", type=str, default="/etc/send_nsca.cfg", help="Path to config file (default %default)")
+    parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="Be more verbose in output")
+    parser.add_option("-V", "--version", dest="version", action="store_true", default=False, help="Show version number")
+    parser.add_option("-I", "--input-file", default=None, dest="input_file", help="The input file from which to read alerts")
+    parser.add_option("-S", "--socket", default="/var/tmp/send_nsca.sock", dest="socket_name", help="The local UNIX socket to bind for reading alerts")
+    parser.add_option("-D", "--daemon", default=False, dest="daemonize", action="store_true", help="Run this as a daemon. Requires -S <socket> to point a named pipe or such to relay alerts")
+    parser.add_option("-F", "--foreground", default=False, dest="foreground", action="store_true", help="Run this as a foreground server. Requires -S <socket> to point a named pipe or such to relay alerts")
+    parser.add_option("-r", "--chroot", default="/var/tmp", dest="work_dir", help="When running as a daemon/foreground, specify where it will chroot()")
+    parser.add_option("-u", "--uid", default="nobody", dest="exec_user", help="When running as a daemon/foreground, specify which user the daemon will run under")
+    parser.add_option("-g", "--gid", default="nogroup", dest="exec_group", help="When running as a daemon/foreground, specify which group the daemon will run under")
+    opts, args = parser.parse_args()
+
+    format_str = "%(message)s"
+    logging.basicConfig(stream=sys.stderr, level=logging.DEBUG if opts.verbose else logging.INFO, fmt=format_str)
+
+    if args:
+        parser.error("This program takes no un-flagged command-line options")
+    if opts.version:
+        print "py_send_nsca %s " %send_nsca.version
+        return 0
+    if not opts.host_address:
+        parser.error("-H is required")
+    if len(opts.delimiter) > 1:
+        parser.error("delimiter must be a single character")
+    if opts.timeout < 0:
+        parser.error("timeout must be nonnegative")
+    if not opts.input_file:
+        opts.input_file = sys.stdin
+    else:
+        opts.input_file = open(opts.input_file, 'r')
+    if opts.daemonize or opts.foreground:
+        if not opts.socket_name:
+            parser.error("-S <socket> is required when running as a daemon")
+
+        if opts.foreground:
+            if opts.verbose:
+                print "Running server on socket '%s' in foreground..." % (opts.socket_name)
+            daemon_main_program(opts)
+        else:
+            with daemon.DaemonContext(
+                working_directory=opts.work_dir,
+                umask=0o002,
+                uid=getpwnam(opts.exec_user).pw_uid,
+                gid=getgrnam(opts.exec_group).gr_gid,
+                ): daemon_main_program(opts)
+    else: # If not a daemon only process connection info once
+        connection_process(opts, opts.input_file)
 
 if __name__ == '__main__':
     sys.exit(main())
