@@ -45,7 +45,7 @@ from . import nagios
 MAX_PASSWORD_LENGTH = 512
 MAX_HOSTNAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 128
-MAX_PLUGINOUTPUT_LENGTH = 512
+MAX_PLUGINOUTPUT_LENGTH = 4096
 
 _TRANSMITTED_IV_SIZE = 128
 
@@ -276,7 +276,7 @@ class NscaSender(object):
 
         Arguments:
             config_path: path to the nsca config file. Usually /etc/send_nsca.cfg. None to disable.
-            remote_host: host to send to
+            remote_host: hosts to send to
             send_to_all: If true, will repeat your message to *all* hosts that match the lookup for remote_host
         """
         self.port = port
@@ -359,20 +359,22 @@ class NscaSender(object):
     def send_host(self, host, state, description):
         return self.send_service(host, b'', state, description)
 
-    def _sock_connect(self, host, port, timeout=None, connect_all=True):
+    def _sock_connect(self, hosts, port, timeout=None, connect_all=True):
         conns = []
-        for (family, socktype, proto, canonname, sockaddr) in socket.getaddrinfo(
-                host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, 0):
-            try:
-                s = socket.socket(family, socktype, proto)
-                if timeout is not None:
-                    s.settimeout(timeout)
-                s.connect(sockaddr)
-                conns.append(s)
-                if not connect_all:
-                    break
-            except socket.error:
-                continue
+        for host in hosts:
+            for (family, socktype, proto, canonname, sockaddr) in socket.getaddrinfo(
+                    host, port, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, 0):
+                try:
+                    s = socket.socket(family, socktype, proto)
+                    if timeout is not None:
+                        s.settimeout(timeout)
+                    s.connect(sockaddr)
+                    conns.append(s)
+                    if not connect_all:
+                        break
+                except socket.error as err:
+                    log.error("could not connect to %s:%d" % (host, self.port))
+                    continue
         if not conns:
             raise socket.error("could not connect to %s:%d" % (self.remote_host, self.port))
         return conns
